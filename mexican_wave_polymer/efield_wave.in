@@ -1,0 +1,149 @@
+# =============================================================================
+#  efield_wave.in
+#  Travelling, truly sinusoidal (+/-) TRANSVERSE electric field on ONE periodic
+#  polymer chain lying along x -> "stadium / Mexican wave" that runs through
+#  the periodic x-boundary.  ReaxFF + QEq, units real.
+#
+#      Ey(x,t) = E0(t) * sin( k*(x - xlo) - w*t )        Ex = Ez = 0
+#      k = 2*pi*nwave/Lx   whole wavelengths in the box -> seamless across PBC
+#      w = 2*pi/Tper       field swings between +E0 and -E0 (no offset)
+#      phase speed c = w/k = Lx/(nwave*Tper), travelling towards +x
+#      (use sin(k*(x-xlo) + w*t) to send it towards -x)
+#
+#  ${workdir} must contain ffield.reax.cho and PP_chain.data / PC_chain.data
+#  (make_chain.py writes them there). The script creates
+#      ${workdir}/dump/  trajectories for OVITO/VMD
+#      ${workdir}/data/  log, slab profiles, species, minimised/final structures
+#  All file names carry a run tag (system + parameters), so runs with
+#  different settings do not overwrite each other.
+#
+#  Needs LAMMPS >= 15Jun2023 (fix efield "potential" keyword).
+#  Tested with the 22Jul2025 stable release on periodic PP and PC chains.
+# =============================================================================
+
+# ------------------------------ paths and system -----------------------------
+variable  workdir  index  ./mexican_wave
+variable  sys      index  PP                                 # PP or PC
+variable  ffield   index  ${workdir}/ffield.reax.cho         # C/H/O ReaxFF (Chenoweth 2008)
+
+if "${sys} == PP" then &
+   "variable elem index 'C H'"    "variable data index ${workdir}/PP_chain.data" &
+elif "${sys} == PC" &
+   "variable elem index 'C H O'"  "variable data index ${workdir}/PC_chain.data" &
+else &
+   "print '*** sys must be PP or PC ***'" "quit 1"
+
+# ------------------------------ wave parameters ------------------------------
+variable  E0       index  0.25      # amplitude in V/Angstrom (units real): +E0 ... -E0
+variable  nwave    index  1         # number of whole wavelengths in the box (INTEGER)
+variable  Tper     index  1000.0    # period in fs (swiggle's period is also TIME, not steps)
+variable  nramp    index  2         # switch the field on smoothly over this many periods (> 0)
+variable  ncyc     index  50        # number of periods with the field on
+
+# ------------------------------ MD parameters --------------------------------
+variable  Temp     index  300.0     # K  (10-50 K gives much cleaner pictures)
+variable  dt       index  0.25      # fs
+variable  neq      index  40000     # equilibration steps without field (10 ps)
+variable  seed     index  4928459
+variable  Ndump    index  100       # dump every 25 fs = 40 frames per period
+variable  relax_x  index  1         # 1 = relax Lx to zero axial stress while minimising
+
+# ------------------------------ output folders -------------------------------
+variable  tag      index  ${sys}_E${E0}_n${nwave}_P${Tper}_T${Temp}
+variable  dumpdir  index  ${workdir}/dump
+variable  datadir  index  ${workdir}/data
+shell     mkdir ${dumpdir} ${datadir}
+log       ${datadir}/log_${tag}.lammps
+
+# ------------------------------ initialization -------------------------------
+units           real
+atom_style      charge
+
+# x periodic: the wave travels through this boundary.
+# y MUST be non-periodic: fix qeq/reaxff refuses a non-constant field component
+# along a periodic direction. z is open too -> isolated chain in vacuum.
+boundary        p s s
+
+read_data       ${data}
+
+pair_style      reaxff NULL checkqeq yes safezone 1.6 mincap 100
+pair_coeff      * * ${ffield} ${elem}
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes
+
+fix             fqeq all qeq/reaxff 1 0.0 10.0 1.0e-6 reaxff maxiter 400
+
+timestep        ${dt}
+
+# ------------------------------ relax + equilibrate (no field) ---------------
+thermo_style    custom step temp pe pxx lx ly lz f_fqeq
+thermo          100
+min_style       cg
+minimize        1.0e-8 1.0e-10 5000 50000                # internal coordinates at fixed Lx
+if "${relax_x} == 1" then &
+   "fix fbox all box/relax x 0.0 vmax 0.001" &
+   "minimize 1.0e-8 1.0e-10 5000 50000" &
+   "unfix fbox" &
+   "minimize 1.0e-8 1.0e-10 5000 50000"
+print           "MINIMIZED: pe = $(pe:%.3f) kcal/mol | Lx = $(lx:%.3f) A | Pxx = $(pxx:%.0f) atm"
+write_data      ${datadir}/${tag}_minimized.data
+reset_timestep  0
+
+velocity        all create ${Temp} ${seed} mom yes rot no dist gaussian
+fix             fnvt all nvt temp ${Temp} ${Temp} 100.0
+fix             fmom all momentum 100 linear 1 1 1      # no drift of the whole chain
+
+thermo          1000
+run             ${neq}
+
+# ------------------------------ travelling wave ------------------------------
+reset_timestep  0                                       # t = step*dt starts at 0
+
+variable  tnow   equal  step*dt                                   # fs
+variable  k      equal  2.0*PI*${nwave}/lx                        # 1/Angstrom
+variable  w      equal  2.0*PI/${Tper}                            # 1/fs
+variable  tramp  equal  ${nramp}*${Tper}
+variable  env    equal  ternary(v_tnow<v_tramp,sin(0.5*PI*v_tnow/v_tramp)^2,1.0)
+variable  Eamp   equal  ${E0}*v_env                               # V/Angstrom
+
+# per-atom field: same instant, different phase at every x -> travelling wave
+variable  Ey     atom   v_Eamp*sin(v_k*(x-xlo)-v_w*v_tnow)
+
+# Electric potential (V) seen by the charge equilibration, Ey = -d(phi)/dy,
+# measured from the chain axis. A transverse travelling wave is not curl-free,
+# so this is its local potential; the FORCES q*Ey on the atoms are exact.
+variable  ycm    equal  xcm(all,y)
+variable  phi    atom   -(y-v_ycm)*v_Ey
+
+fix       fwave  all efield 0.0 v_Ey 0.0 potential v_phi
+
+variable  lam    equal  lx/${nwave}
+variable  cph    equal  v_lam/${Tper}*1.0e5                       # m/s
+print     "WAVE: lambda = ${lam} A | period = ${Tper} fs | speed = ${cph} m/s | E0 = +/-${E0} V/A"
+
+# ---- diagnostics (all in ${datadir}) ----------------------------------------
+# 20 slabs along x (Coord1 = x/Lx). Per slab: transverse displacement dy,
+# transverse dipole py (x Ncount = slab dipole, e*A) and the applied Ey.
+# Subtract each slab's time average (static tacticity/zigzag pattern), then
+# plot slab vs time as a colour map: the stripes are the stadium wave.
+variable  dy     atom   y-v_ycm                                   # Angstrom
+variable  py     atom   q*(y-v_ycm)                               # e*Angstrom
+compute   cslab  all chunk/atom bin/1d x lower 0.05 units reduced
+fix       fprof  all ave/chunk 10 10 200 cslab v_dy v_py v_Ey file ${datadir}/${tag}_wave_profile.dat
+
+# bond-breaking check (strong fields + QEq can over-polarise / fragment).
+# Nevery = Nrepeat = 1 -> no bond-order averaging, neighbor settings untouched.
+fix       fspec  all reaxff/species 1 1 1000 ${datadir}/${tag}_species.out element ${elem}
+
+# ---- trajectory (in ${dumpdir}) for OVITO/VMD: colour by q or v_Ey ----------
+dump      dtraj  all custom ${Ndump} ${dumpdir}/${tag}_wave.lammpstrj id type element q x y z v_Ey
+dump_modify dtraj element ${elem} sort id
+
+thermo_style    custom step time temp pe etotal v_Eamp f_fwave f_fwave[2] f_fqeq
+thermo          1000
+
+variable  nprod  equal  round(${ncyc}*${Tper}/${dt})
+run       ${nprod}
+
+write_data  ${datadir}/${tag}_after_wave.data
