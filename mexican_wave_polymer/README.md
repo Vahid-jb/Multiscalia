@@ -1,5 +1,8 @@
 # Mexican wave: travelling electric field on a polymer chain (LAMMPS + ReaxFF)
 
+<img width="720" height="344" alt="PP_PC_field_wave" src="https://github.com/user-attachments/assets/0023ab4f-a721-4607-8dad-8cc074b18122" />
+
+
 Applies a sinusoidal, travelling, transverse electric field
 
     Ey(x,t) = E0 · sin(k·x − ω·t),   k = 2π·nwave/Lx,   ω = 2π/Tper
